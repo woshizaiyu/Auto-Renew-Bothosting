@@ -132,11 +132,92 @@ def wait_for_turnstile_pass(sb, timeout=30):
         page_lower = sb.get_page_source().lower()
         if not any(x in page_lower for x in cf_indicators):
             print("✅ Turnstile 验证已通过")
-            # sb.save_screenshot("turnstile_passed.png")
             return True
         sb.sleep(1)
     print("❌ Turnstile 验证超时未通过")
     return False
+
+# CDP 级别鼠标点击（反检测，比 sb.click() 更难被拦截）
+def cdp_click_element(driver, selector="", element=None, timeout=10):
+    try:
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+
+        if element is None and selector:
+            element = WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+            )
+        if element is None:
+            return False
+
+        driver.execute_script("arguments[0].scrollIntoView({block:'center',behavior:'instant'});", element)
+        time.sleep(0.5)
+
+        rect = driver.execute_script("""
+            const r = arguments[0].getBoundingClientRect();
+            return {x: r.left + r.width/2, y: r.top + r.height/2, w: r.width, h: r.height};
+        """, element)
+        if not rect or rect["w"] == 0 or rect["h"] == 0:
+            return False
+
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": rect["x"], "y": rect["y"],
+            "button": "left", "clickCount": 1,
+        })
+        time.sleep(0.05 + random.random() * 0.15)
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": "mouseReleased", "x": rect["x"], "y": rect["y"],
+            "button": "left", "clickCount": 1,
+        })
+        return True
+    except Exception as e:
+        print(f"  CDP 点击失败: {e}")
+        return False
+
+# 通过 JS 在浏览器内查找弹窗中的续期按钮（抗翻译插件，用图标定位）
+def find_modal_renew_btn(driver):
+    return driver.execute_script("""
+        const modal = document.querySelector('[class*="modal"],[class*="dialog"],[role="dialog"]');
+        const root = modal || document;
+
+        // ① 图标定位：fa-clock 图标 → 父级按钮
+        const icon = root.querySelector('i.fa-clock, i.fa-regular.fa-clock');
+        if (icon) {
+            const btn = icon.closest('button');
+            if (btn) {
+                const r = btn.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) {
+                    btn.scrollIntoView({block:'center'});
+                    return {found:true, x:r.left+r.width/2, y:r.top+r.height/2};
+                }
+            }
+        }
+
+        // ② 结构定位：inline-flex span 中的 Renew 文字
+        const span = root.querySelector('span.inline-flex');
+        if (span && span.textContent.includes('Renew')) {
+            const btn = span.closest('button') || span;
+            const r = btn.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+                btn.scrollIntoView({block:'center'});
+                return {found:true, x:r.left+r.width/2, y:r.top+r.height/2};
+            }
+        }
+
+        // ③ 兜底：任何可见的含 Renew 文字的按钮
+        const btns = root.querySelectorAll('button');
+        for (const b of btns) {
+            if (b.textContent.includes('Renew') && b.offsetParent !== null) {
+                const r = b.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) {
+                    b.scrollIntoView({block:'center'});
+                    return {found:true, x:r.left+r.width/2, y:r.top+r.height/2};
+                }
+            }
+        }
+        return {found:false};
+    """)
     
 # 获取当前出口ip
 def get_current_ip(proxy_server: str = "") -> str:
@@ -465,17 +546,26 @@ def main():
             except Exception as e:
                 pass
 
-        # 点击外部续期按钮等待弹窗
+        # 点击外部续期按钮等待弹窗（优先 CDP，兜底 sb.click）
         if outer_renew_selector:
             print("🔄 点击外部续期按钮，等待验证窗口...")
-            try:
-                sb.sleep(2)
-                sb.click(outer_renew_selector)
-                sb.sleep(15)  # 等待模态框加载，可能因网络因素加载慢
-            except Exception as e:
-                print(f"❌ 点击外部按钮失败: {e}")
+            sb.sleep(2)
+            driver = sb.driver
+            clicked = cdp_click_element(driver, selector=outer_renew_selector, timeout=5)
+            if not clicked:
+                print("  CDP 点击失败，尝试 sb.click 兜底...")
+                try:
+                    sb.click(outer_renew_selector)
+                    clicked = True
+                except Exception as e:
+                    print(f"  sb.click 也失败: {e}")
+            if clicked:
+                sb.save_screenshot("after_outer_click.png")
+            else:
+                print(f"❌ 外部续期按钮点击失败")
                 send_telegram_message(format_notification("❌ 续期失败", error="点击外部续期按钮出错"))
                 return
+            sb.sleep(15)  # 等待模态框加载，可能因网络因素加载慢
 
             # 处理弹窗中的 Turnstile
             print("🔒 检测弹窗中的 Turnstile 验证...")
@@ -498,18 +588,44 @@ def main():
                 send_telegram_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
                 return
 
-            # 点击续期按钮
+            # 点击续期按钮（CDP 反检测 + 图标定位）
             print("⏳ 等待续期按钮可用并点击...")
-            time.sleep(5) 
+            time.sleep(3)
+            sb.save_screenshot("modal_turnstile_passed.png")
 
             modal_button_clicked = False
-            try:
-                sb.click('button:contains("Renew for 4 days")', timeout=8)
+            driver = sb.driver
+            # 等一小段时间让 modal 稳定
+            for _ in range(15):
+                btn_info = find_modal_renew_btn(driver)
+                if btn_info.get("found"):
+                    break
+                time.sleep(1)
+            if btn_info.get("found"):
+                x, y = btn_info["x"], btn_info["y"]
+                print(f"  找到续期按钮，CDP 坐标 ({x:.1f}, {y:.1f})")
+                driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                    "type": "mousePressed", "x": x, "y": y,
+                    "button": "left", "clickCount": 1,
+                })
+                time.sleep(0.05 + random.random() * 0.15)
+                driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                    "type": "mouseReleased", "x": x, "y": y,
+                    "button": "left", "clickCount": 1,
+                })
                 modal_button_clicked = True
-                print("✅ 已点击续期按钮")
-            except Exception as e:
-                print(f"续期按钮点击失败: {e}")
+                print("✅ 已通过 CDP 点击续期按钮")
+            else:
+                print("⚠️ JS 未找到续期按钮，尝试 sb.click 兜底...")
+                try:
+                    sb.click('button:contains("Renew")', timeout=5)
+                    modal_button_clicked = True
+                    print("✅ 已通过 sb.click 点击续期按钮（兜底）")
+                except Exception as e:
+                    print(f"❌ 续期按钮点击失败: {e}")
+                    sb.save_screenshot("modal_click_failed.png")
 
+            sb.save_screenshot("after_modal_click.png")
             print("⏳ 等待新的过期时间...")
             sb.sleep(6)
 
